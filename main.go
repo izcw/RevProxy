@@ -2,167 +2,439 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
-	"syscall"  // 新增：用于调用Windows系统API（设置窗口标题）
-	"runtime"  // 新增：用于判断操作系统（仅Windows生效）
-	"unsafe"   // 新增：用于处理指针转换（适配系统API参数）
+	"unsafe"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 const iniFile = "proxy.ini"
 
-type config struct {
-	Backend string
+// Route 表示一条前缀->目标的代理规则
+type Route struct {
+	Prefix string
+	Target *url.URL
+	Proxy  *httputil.ReverseProxy
+}
+
+// ConfigRuntime 保存运行时代理配置
+type ConfigRuntime struct {
+	sync.RWMutex
 	Port    int
+	Routes  []*Route
+	Updated time.Time
 }
 
-// 加载配置文件，不存在或格式错误则交互式创建
-func loadOrCreateConfig() config {
-	if _, err := os.Stat(iniFile); os.IsNotExist(err) {
-		log.Println("配置文件不存在，开始创建新配置")
-		return interactiveNewConfig()
-	}
+var cfg = &ConfigRuntime{}
 
-	file, err := os.Open(iniFile)
-	if err != nil {
-		log.Printf("打开配置文件失败: %v，开始创建新配置", err)
-		return interactiveNewConfig()
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	if !scanner.Scan() {
-		log.Printf("配置文件内容为空或读取失败: %v，开始创建新配置", scanner.Err())
-		return interactiveNewConfig()
-	}
-
-	// 解析配置内容
-	parts := strings.Fields(scanner.Text())
-	if len(parts) != 2 {
-		log.Println("配置文件格式错误，正确格式: [后端地址] [端口]，开始重新创建")
-		return interactiveNewConfig()
-	}
-
-	backend := parts[0]
-	port, err := strconv.Atoi(parts[1])
-	if err != nil || port < 1 || port > 65535 {
-		log.Println("配置文件中端口无效（必须是1-65535的整数），开始重新创建")
-		return interactiveNewConfig()
-	}
-
-	if _, err := url.Parse(backend); err != nil {
-		log.Printf("配置文件中后端地址格式无效: %v，开始重新创建", err)
-		return interactiveNewConfig()
-	}
-
-	return config{Backend: backend, Port: port}
+// Stats 保存运行时指标
+type Stats struct {
+	StartTime      time.Time
+	TotalRequests  uint64
+	PerRouteCounts map[string]uint64
+	UniqueClients  map[string]struct{}
+	Mutex          sync.Mutex
+	QPS            int64
+	lastQPSReset   time.Time
 }
 
-// 交互式录入配置，带格式验证
-func interactiveNewConfig() config {
-	reader := bufio.NewReader(os.Stdin)
-	var backend string
-	var port int
-
-
-	// 后端地址输入及验证
-	for {
-		fmt.Print(">请输入后端服务地址 (例如: 192.168.x.x): ")
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			log.Printf("输入错误: %v，请重试", err)
-			continue
-		}
-		backend = strings.TrimSpace(input)
-
-		if backend == "" {
-			fmt.Println("后端地址不能为空，请重新输入")
-			continue
-		}
-
-		// 自动添加http://前缀
-		if !strings.HasPrefix(backend, "http://") && !strings.HasPrefix(backend, "https://") {
-			backend = "http://" + backend
-			fmt.Printf("已自动添加 http:// 前缀，当前地址: %s\n", backend)
-		}
-
-		if _, err := url.Parse(backend); err != nil {
-			fmt.Printf("地址格式不正确: %v，请重新输入\n", err)
-			continue
-		}
-		break
-	}
-
-	// 端口输入及验证
-	for {
-		fmt.Print(">请输入本地监听端口 (1-65535): ")
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			log.Printf("输入错误: %v，请重试", err)
-			continue
-		}
-		portStr := strings.TrimSpace(input)
-
-		port, err = strconv.Atoi(portStr)
-		if err != nil || port < 1 || port > 65535 {
-			fmt.Println("端口必须是1-65535之间的整数，请重新输入")
-			continue
-		}
-		break
-	}
-
-	config := config{Backend: backend, Port: port}
-	if err := saveConfig(config); err != nil {
-		log.Fatalf("保存配置失败: %v", err)
-	}
-	fmt.Println("配置已成功保存到", iniFile)
-	return config
+var stats = &Stats{
+	StartTime:      time.Now(),
+	PerRouteCounts: make(map[string]uint64),
+	UniqueClients:  make(map[string]struct{}),
+	lastQPSReset:   time.Now(),
 }
 
-// 保存配置到文件
-func saveConfig(c config) error {
-	file, err := os.Create(iniFile)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	_, err = fmt.Fprintf(file, "%s %d\n", c.Backend, c.Port)
-	return err
-}
-
-// 日志中间件：记录请求信息和响应时间
-func logMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		lw := &logResponseWriter{ResponseWriter: w, status: http.StatusOK}
-		next(lw, r)
-		log.Printf("[%.3fms] %s %s -> %d",
-			time.Since(start).Seconds()*1000,
-			r.Method, r.URL.Path, lw.status)
-	}
-}
-
-// 用于捕获HTTP响应状态码的包装器
-type logResponseWriter struct {
+// loggingResponseWriter 捕获响应状态和字节数
+type loggingResponseWriter struct {
 	http.ResponseWriter
-	status int
+	status  int
+	written int64
 }
 
-func (l *logResponseWriter) WriteHeader(code int) {
-	l.status = code
+func (l *loggingResponseWriter) WriteHeader(code int) {
+	if l.status == 0 {
+		l.status = code
+	}
 	l.ResponseWriter.WriteHeader(code)
 }
 
-func main() {
+func (l *loggingResponseWriter) Write(b []byte) (int, error) {
+	if l.status == 0 {
+		l.status = http.StatusOK
+	}
+	n, err := l.ResponseWriter.Write(b)
+	l.written += int64(n)
+	return n, err
+}
 
+// -----------------------------
+// URL 校验
+// -----------------------------
+func validateTarget(raw string) (*url.URL, error) {
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("不支持的 scheme: %s", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, errors.New("目标 URL 缺少 host")
+	}
+	hostOnly := u.Host
+	if strings.Contains(hostOnly, ":") {
+		hostOnly, _, _ = net.SplitHostPort(hostOnly)
+	}
+	if hostOnly != "localhost" && net.ParseIP(hostOnly) == nil && !strings.Contains(hostOnly, ".") {
+		return nil, fmt.Errorf("目标 host 非法: %s (需为 IP 或合法域名)", hostOnly)
+	}
+	if u.Path == "" {
+		u.Path = "/"
+	}
+	return u, nil
+}
+
+// -----------------------------
+// 配置文件解析与热加载
+// -----------------------------
+func loadOrCreateIni() error {
+	if _, err := os.Stat(iniFile); os.IsNotExist(err) {
+		if err := createDefaultIni(); err != nil {
+			return fmt.Errorf("自动创建默认配置失败: %v", err)
+		}
+		log.Printf("已自动创建默认配置 %s", iniFile)
+	}
+
+	if err := parseIniAndApply(iniFile); err != nil {
+		backup := iniFile + ".broken." + time.Now().Format("20060102150405")
+		_ = os.Rename(iniFile, backup)
+		log.Printf("配置解析失败，已备份为 %s: %v", backup, err)
+		if err := createDefaultIni(); err != nil {
+			return fmt.Errorf("解析失败且自动重建默认配置失败: %v", err)
+		}
+		return fmt.Errorf("配置文件格式错误，已备份为 %s，请检查并重启: %v", backup, err)
+	}
+	return nil
+}
+
+func createDefaultIni() error {
+	content := `# 第一处出现的端口号（纯数字）将被视为监听端口（可在任意位置）
+# 每个路由行格式：/prefix http://host:port/optionalPath
+# 空行和 # 注释会被忽略
+
+4288
+
+/api http://127.0.0.1:3000
+/MFP62 http://192.168.0.100
+`
+	return os.WriteFile(iniFile, []byte(content), 0644)
+}
+
+func parseIniAndApply(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	var port int
+	var parsedRoutes []*Route
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || line == "/" {
+			continue
+		}
+
+		if port == 0 {
+			if p, err := strconv.Atoi(line); err == nil {
+				if p < 1 || p > 65535 {
+					return fmt.Errorf("第 %d 行端口超出范围: %d", lineNo, p)
+				}
+				port = p
+				continue
+			}
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			return fmt.Errorf("第 %d 行格式错误（应为: /prefix target）: %s", lineNo, line)
+		}
+		prefix := parts[0]
+		if !strings.HasPrefix(prefix, "/") {
+			return fmt.Errorf("第 %d 行前缀必须以 / 开头: %s", lineNo, prefix)
+		}
+		targetRaw := parts[1]
+		targetURL, verr := validateTarget(targetRaw)
+		if verr != nil {
+			return fmt.Errorf("第 %d 行目标地址无效: %v", lineNo, verr)
+		}
+
+		for _, r := range parsedRoutes {
+			if r.Prefix == prefix {
+				return fmt.Errorf("第 %d 行重复定义路由前缀: %s", lineNo, prefix)
+			}
+		}
+
+		targetCopy := *targetURL
+		proxy := httputil.NewSingleHostReverseProxy(&targetCopy)
+		proxy.Director = makeDirector(prefix, &targetCopy)
+		// ↓↓↓ 替换原来的 ErrorHandler
+		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("proxy error -> %s | %v", r.URL.String(), err)
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusBadGateway) // 状态码仍可保持 502
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": 502,
+				"msg":    "后端服务不可用",
+				"detail": err.Error(),
+			})
+		}
+
+		if len(prefix) > 1 {
+			prefix = strings.TrimRight(prefix, "/")
+		}
+		parsedRoutes = append(parsedRoutes, &Route{Prefix: prefix, Target: targetURL, Proxy: proxy})
+	}
+
+	if port == 0 {
+		port = 4288
+	}
+
+	sort.Slice(parsedRoutes, func(i, j int) bool {
+		return len(parsedRoutes[i].Prefix) > len(parsedRoutes[j].Prefix)
+	})
+
+	cfg.Lock()
+	cfg.Port = port
+	cfg.Routes = parsedRoutes
+	cfg.Updated = time.Now()
+	cfg.Unlock()
+
+	log.Printf("配置加载成功：port=%d routes=%d", port, len(parsedRoutes))
+	return nil
+}
+
+// Director 函数生成
+func makeDirector(prefix string, target *url.URL) func(*http.Request) {
+	return func(req *http.Request) {
+		origPath := req.URL.Path
+		trimmed := strings.TrimPrefix(origPath, prefix)
+		if trimmed == "" {
+			trimmed = "/"
+		}
+		if !strings.HasPrefix(trimmed, "/") {
+			trimmed = "/" + trimmed
+		}
+		var newPath string
+		if target.Path != "/" && strings.HasPrefix(trimmed, target.Path) {
+			newPath = trimmed
+		} else {
+			newPath = joinURLPath(target.Path, trimmed)
+		}
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.URL.Path = newPath
+		req.URL.RawPath = newPath
+		req.Host = target.Host
+
+		if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+			prior := req.Header.Get("X-Forwarded-For")
+			if prior != "" {
+				req.Header.Set("X-Forwarded-For", prior+", "+clientIP)
+			} else {
+				req.Header.Set("X-Forwarded-For", clientIP)
+			}
+		}
+	}
+}
+
+// joinURLPath
+func joinURLPath(a, b string) string {
+	if a == "/" {
+		return b
+	}
+	if strings.HasSuffix(a, "/") && strings.HasPrefix(b, "/") {
+		return a + strings.TrimPrefix(b, "/")
+	}
+	if !strings.HasSuffix(a, "/") && !strings.HasPrefix(b, "/") {
+		return a + "/" + b
+	}
+	return a + b
+}
+
+// -----------------------------
+// 热加载监控
+// -----------------------------
+func watchIniFile(path string) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("无法创建 fsnotify 监控: %v", err)
+		return
+	}
+	defer watcher.Close()
+
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	if err := watcher.Add(dir); err != nil {
+		log.Printf("无法添加监控目录: %v", err)
+		return
+	}
+
+	var reloadMu sync.Mutex
+	var lastReload time.Time
+
+	for {
+		select {
+		case ev := <-watcher.Events:
+			if ev.Name == path && (ev.Op&fsnotify.Write == fsnotify.Write || ev.Op&fsnotify.Create == fsnotify.Create || ev.Op&fsnotify.Rename == fsnotify.Rename) {
+				if time.Since(lastReload) < time.Second {
+					continue
+				}
+				reloadMu.Lock()
+				lastReload = time.Now()
+				reloadMu.Unlock()
+
+				log.Printf("配置文件发生更改：%s", ev.String())
+				if err := parseIniAndApply(path); err != nil {
+					log.Printf("重新加载配置失败：%v（保留旧配置）", err)
+				} else {
+					stats.Mutex.Lock()
+					stats.lastQPSReset = time.Now()
+					stats.Mutex.Unlock()
+				}
+			}
+		case err := <-watcher.Errors:
+			log.Printf("fsnotify 错误: %v", err)
+		}
+	}
+}
+
+// -----------------------------
+// HTTP 处理
+// -----------------------------
+func handler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	clientIP := r.RemoteAddr
+	path := r.URL.Path
+	method := r.Method
+
+	stats.Mutex.Lock()
+	stats.TotalRequests++
+	stats.UniqueClients[clientIP] = struct{}{}
+	stats.QPS++
+	stats.Mutex.Unlock()
+
+	cfg.RLock()
+	defer cfg.RUnlock()
+	for _, route := range cfg.Routes {
+		if path == route.Prefix || strings.HasPrefix(path, route.Prefix+"/") {
+			lw := &loggingResponseWriter{ResponseWriter: w}
+			route.Proxy.ServeHTTP(lw, r)
+			stats.Mutex.Lock()
+			stats.PerRouteCounts[route.Prefix]++
+			stats.Mutex.Unlock()
+			duration := time.Since(start)
+			log.Printf("%-4s %-5s -> %-20s | %3d | %7.2fms | %6dB | %s", method, path, route.Target.String(), lw.status, float64(duration.Microseconds())/1000.0, lw.written, clientIP)
+			return
+		}
+	}
+	// 未匹配到任何路由
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusNotFound)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": 404,
+		"msg":    "没有这个前缀的代理路由，请检查配置文件",
+	})
+}
+
+// -----------------------------
+// 状态监控接口
+// -----------------------------
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	stats.Mutex.Lock()
+	defer stats.Mutex.Unlock()
+
+	data := map[string]interface{}{
+		"startTime":      stats.StartTime.Format("2006-01-02 15:04:05"),
+		"uptime":         int(time.Since(stats.StartTime).Seconds()),
+		"totalRequests":  stats.TotalRequests,
+		"perRouteCounts": stats.PerRouteCounts,
+		"uniqueClients":  len(stats.UniqueClients),
+		"qps":            stats.QPS,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+
+	// 每秒重置 qps
+	if time.Since(stats.lastQPSReset) > time.Second {
+		stats.QPS = 0
+		stats.lastQPSReset = time.Now()
+	}
+}
+
+// -----------------------------
+// Banner
+// -----------------------------
+func printStartupBanner() {
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+
+	cfg.RLock()
+	port := cfg.Port
+	routes := cfg.Routes
+	updated := cfg.Updated
+	cfg.RUnlock()
+
+	fmt.Println("════════════════════════════════════════════════════════")
+	fmt.Println("              Golang · 多目标反向代理服务")
+	fmt.Println("────────────────────────────────────────────────────────")
+	fmt.Printf("监听端口: %d\n", port)
+	fmt.Printf("配置文件: %s (最后更新时间: %s)\n", iniFile, updated.Format("2006-01-02 15:04:05"))
+	fmt.Printf("内存占用: %d MB\n", mem.Alloc/1024/1024)
+	fmt.Printf("Go 版本: %-10s  CPU: %d 核  Goroutines: %d\n", runtime.Version(), runtime.NumCPU(), runtime.NumGoroutine())
+	fmt.Printf("启动时间: %s\n", stats.StartTime.Format("2006-01-02 15:04:05"))
+	fmt.Printf("状态监控: http://127.0.0.1:%d/status\n", port)
+	fmt.Println("────────────────────────────────────────────────────────")
+	fmt.Println("路由列表:")
+	for i := len(routes) - 1; i >= 0; i-- {
+		r := routes[i]
+		fmt.Printf("  %-10s -> %s\n", r.Prefix, r.Target.String())
+	}
+	fmt.Println("════════════════════════════════════════════════════════")
+}
+
+// -----------------------------
+// main
+// -----------------------------
+func main() {
 	// 【新增】设置控制台窗口标题（仅Windows生效）
 	if runtime.GOOS == "windows" {
 		// 加载kernel32.dll
@@ -176,7 +448,7 @@ func main() {
 				log.Printf("获取系统函数失败: %v", err)
 			} else {
 				// 自定义窗口标题
-				customTitle := "Golang · 反向代理服务"
+				customTitle := "Golang · 多目标反向代理服务"
 				// 调用系统函数设置标题（需要将Go字符串转为UTF-16指针）
 				_, _, err := setTitleProc.Call(
 					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(customTitle))),
@@ -187,43 +459,47 @@ func main() {
 			}
 		}
 	}
-	
-	// 加载或创建配置
-	c := loadOrCreateConfig()
 
-	// 解析后端地址
-	target, err := url.Parse(c.Backend)
-	if err != nil {
-		log.Fatalf("后端地址解析失败: %v", err)
+	// 关键：自定义 log 前缀格式
+	log.SetFlags(0) // 先关掉默认前缀
+	log.SetPrefix("[" + time.Now().Format("2006-01-02 15:04:05") + "] ")
+
+	if err := loadOrCreateIni(); err != nil {
+		log.Fatalf("初始化失败: %v", err)
 	}
 
-	// 创建反向代理
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	director := proxy.Director
-	proxy.Director = func(r *http.Request) {
-		director(r)
-		r.Host = "127.0.0.1"
+	go watchIniFile(iniFile)
+
+	printStartupBanner()
+	log.Printf("服务已启动，监听端口 %d\n", cfg.Port)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", statusHandler)
+	mux.HandleFunc("/", handler)
+
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", cfg.Port),
+		Handler: mux,
 	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("代理错误: %v", err)
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+
+	// 优雅退出
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("ListenAndServe: %v", err)
+		}
+	}()
+
+	<-stop
+	log.Printf("接收到退出信号，正在关闭服务器...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("Server Shutdown Failed:%+v", err)
 	}
 
-	// 组合日志中间件和代理处理器
-	handler := logMiddleware(proxy.ServeHTTP)
-
-	// 打印启动信息
-	banner := `
-═══════════════════════════════════════════
-            Golang · 反向代理服务            
-───────────────────────────────────────────
-代理地址: http://127.0.0.1:%d           
-目标服务: %s           
-配置文件: ./%s		           
-═══════════════════════════════════════════
-服务启动成功！
-
-`
-	fmt.Printf(banner, c.Port, c.Backend, iniFile)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", c.Port), handler))
+	log.Printf("服务器已关闭")
 }
