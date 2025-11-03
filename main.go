@@ -28,6 +28,11 @@ import (
 
 const iniFile = "proxy.ini"
 
+// 全局变量
+var (
+	version = "v1.0.0"
+)
+
 // Route 表示一条前缀->目标的代理规则
 type Route struct {
 	Prefix string
@@ -235,7 +240,7 @@ func parseIniAndApply(path string) error {
 	cfg.Updated = time.Now()
 	cfg.Unlock()
 
-	log.Printf("配置加载成功：port=%d routes=%d", port, len(parsedRoutes))
+	// log.Printf("配置加载成功：port=%d routes=%d", port, len(parsedRoutes))
 	return nil
 }
 
@@ -414,7 +419,7 @@ func printStartupBanner() {
 	cfg.RUnlock()
 
 	fmt.Println("════════════════════════════════════════════════════════")
-	fmt.Println("              Golang · 多目标反向代理服务")
+	fmt.Println("            Go · 多目标反向代理服务", version)
 	fmt.Println("────────────────────────────────────────────────────────")
 	fmt.Printf("监听端口: %d\n", port)
 	fmt.Printf("配置文件: %s (最后更新时间: %s)\n", iniFile, updated.Format("2006-01-02 15:04:05"))
@@ -435,6 +440,16 @@ func printStartupBanner() {
 // main
 // -----------------------------
 func main() {
+	// 关键：自定义 log 前缀格式
+	// log.SetFlags(0) // 先关掉默认前缀
+	// log.SetPrefix("[" + time.Now().Format("2006-01-02 15:04:05") + "] ")
+
+	if err := loadOrCreateIni(); err != nil {
+		log.Fatalf("初始化失败: %v", err)
+	}
+
+	go watchIniFile(iniFile)
+
 	// 【新增】设置控制台窗口标题（仅Windows生效）
 	if runtime.GOOS == "windows" {
 		// 加载kernel32.dll
@@ -448,7 +463,7 @@ func main() {
 				log.Printf("获取系统函数失败: %v", err)
 			} else {
 				// 自定义窗口标题
-				customTitle := "Golang · 多目标反向代理服务"
+				customTitle := fmt.Sprintf("Go · RevProxy %s | %d", version, cfg.Port)
 				// 调用系统函数设置标题（需要将Go字符串转为UTF-16指针）
 				_, _, err := setTitleProc.Call(
 					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(customTitle))),
@@ -459,16 +474,6 @@ func main() {
 			}
 		}
 	}
-
-	// 关键：自定义 log 前缀格式
-	log.SetFlags(0) // 先关掉默认前缀
-	log.SetPrefix("[" + time.Now().Format("2006-01-02 15:04:05") + "] ")
-
-	if err := loadOrCreateIni(); err != nil {
-		log.Fatalf("初始化失败: %v", err)
-	}
-
-	go watchIniFile(iniFile)
 
 	printStartupBanner()
 	log.Printf("服务已启动，监听端口 %d\n", cfg.Port)
