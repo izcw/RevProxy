@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -30,7 +31,7 @@ const iniFile = "proxy.ini"
 
 // 全局变量
 var (
-	version = "v1.0.0"
+	version = "v1.0.1"
 )
 
 // Route 表示一条前缀->目标的代理规则
@@ -67,6 +68,9 @@ var stats = &Stats{
 	UniqueClients:  make(map[string]struct{}),
 	lastQPSReset:   time.Now(),
 }
+
+// reloadChan 用于通知主循环重启服务（配置已生效且需要重启）
+var reloadChan = make(chan struct{}, 1)
 
 // loggingResponseWriter 捕获响应状态和字节数
 type loggingResponseWriter struct {
@@ -240,7 +244,6 @@ func parseIniAndApply(path string) error {
 	cfg.Updated = time.Now()
 	cfg.Unlock()
 
-	// log.Printf("配置加载成功：port=%d routes=%d", port, len(parsedRoutes))
 	return nil
 }
 
@@ -295,6 +298,7 @@ func joinURLPath(a, b string) string {
 // -----------------------------
 // 热加载监控
 // -----------------------------
+// 当检测到配置变更并且 parse 成功后，会发送信号到 reloadChan 通知主循环重启服务（立即生效）
 func watchIniFile(path string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -318,27 +322,49 @@ func watchIniFile(path string) {
 	for {
 		select {
 		case ev := <-watcher.Events:
-			if ev.Name == path && (ev.Op&fsnotify.Write == fsnotify.Write || ev.Op&fsnotify.Create == fsnotify.Create || ev.Op&fsnotify.Rename == fsnotify.Rename) {
+			if ev.Name == path && (ev.Op&fsnotify.Write == fsnotify.Write ||
+				ev.Op&fsnotify.Create == fsnotify.Create ||
+				ev.Op&fsnotify.Rename == fsnotify.Rename) {
+
+				reloadMu.Lock()
 				if time.Since(lastReload) < time.Second {
+					reloadMu.Unlock()
 					continue
 				}
-				reloadMu.Lock()
 				lastReload = time.Now()
 				reloadMu.Unlock()
 
 				log.Printf("配置文件发生更改：%s", ev.String())
-				if err := parseIniAndApply(path); err != nil {
-					log.Printf("重新加载配置失败：%v（保留旧配置）", err)
-				} else {
-					stats.Mutex.Lock()
-					stats.lastQPSReset = time.Now()
-					stats.Mutex.Unlock()
-				}
+				safeRestart()
 			}
+
 		case err := <-watcher.Errors:
 			log.Printf("fsnotify 错误: %v", err)
 		}
 	}
+}
+
+// safeRestart 程序自重启
+func safeRestart() {
+	execPath, err := os.Executable()
+	if err != nil {
+		log.Printf("获取可执行文件路径失败: %v", err)
+		return
+	}
+
+	log.Println("检测到配置文件变更，正在重启服务...")
+
+	cmd := exec.Command(execPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("启动新进程失败: %v", err)
+		return
+	}
+
+	log.Println("新进程已启动，退出当前进程...\n\n\n\n\n")
+	os.Exit(0)
 }
 
 // -----------------------------
@@ -436,18 +462,41 @@ func printStartupBanner() {
 	fmt.Println("════════════════════════════════════════════════════════")
 }
 
+// startServer 启动 http.Server 并在后台运行，返回 server 指针
+func startServer() *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", statusHandler)
+	mux.HandleFunc("/", handler)
+
+	cfg.RLock()
+	port := cfg.Port
+	cfg.RUnlock()
+
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: mux,
+	}
+
+	go func() {
+		log.Printf("开始监听端口 %d ...", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("ListenAndServe: %v", err)
+		}
+	}()
+
+	return server
+}
+
 // -----------------------------
 // main
 // -----------------------------
 func main() {
-	// 关键：自定义 log 前缀格式
-	// log.SetFlags(0) // 先关掉默认前缀
-	// log.SetPrefix("[" + time.Now().Format("2006-01-02 15:04:05") + "] ")
-
+	// 初始化配置（文件不存在则创建；存在则解析）
 	if err := loadOrCreateIni(); err != nil {
 		log.Fatalf("初始化失败: %v", err)
 	}
 
+	// 启动配置文件监控（当 parse 成功后会发送重启信号）
 	go watchIniFile(iniFile)
 
 	// 【新增】设置控制台窗口标题（仅Windows生效）
@@ -475,36 +524,46 @@ func main() {
 		}
 	}
 
+	// 打印启动信息与路由
 	printStartupBanner()
 	log.Printf("服务已启动，监听端口 %d\n", cfg.Port)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/status", statusHandler)
-	mux.HandleFunc("/", handler)
+	// 启动第一个 server
+	currentServer := startServer()
 
-	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.Port),
-		Handler: mux,
-	}
-
-	// 优雅退出
+	// 优雅退出与重启控制
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("ListenAndServe: %v", err)
+	for {
+		select {
+		case <-stop:
+			// 收到退出信号，关闭当前服务器并退出程序
+			log.Printf("接收到退出信号，正在关闭服务器...")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := currentServer.Shutdown(ctx); err != nil {
+				log.Fatalf("Server Shutdown Failed:%+v", err)
+			}
+			cancel()
+			log.Printf("服务器已关闭")
+			return
+
+		case <-reloadChan:
+			// 收到配置变更（且 parse 成功）的通知，立即重启服务以应用新端口/路由
+			log.Printf("配置变更生效：准备重启服务以应用新配置...")
+			// 先优雅关闭当前 server（超时 5 秒）
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := currentServer.Shutdown(ctx); err != nil {
+				// 关闭失败也继续尝试启动新服务（记录错误）
+				log.Printf("关闭旧服务时出错: %v（将继续尝试启动新服务）", err)
+			}
+			cancel()
+
+			// 打印新配置 Banner
+			printStartupBanner()
+
+			// 启动新 server（注意：如果新端口已被占用，ListenAndServe 会在后台触发 fatal 与退出）
+			currentServer = startServer()
 		}
-	}()
-
-	<-stop
-	log.Printf("接收到退出信号，正在关闭服务器...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Server Shutdown Failed:%+v", err)
 	}
-
-	log.Printf("服务器已关闭")
 }
