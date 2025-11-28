@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -31,17 +32,18 @@ import (
 const iniFile = "proxy.ini"
 
 // 全局版本
-var version = "v1.0.4"
+var version = "v1.0.5" // 版本号更新
 
 // Route 表示一条代理规则
 type Route struct {
-	Prefix      string   // 原始配置中的前缀（对于 regex 为正则表达式文本）
-	Target      *url.URL // 解析后的目标 URL（Host + Scheme）
-	Proxy       *httputil.ReverseProxy
-	Regex       bool           // 是否使用正则匹配
-	Generic     bool           // generic 标志（保留原语义）
-	Re          *regexp.Regexp // 若 Regex == true，则保存编译后的正则
-	TargetPathT string         // 目标路径模板（允许包含 $1/$2 替换）
+	Prefix        string   // 原始配置中的前缀（对于 regex 为正则表达式文本）
+	Target        *url.URL // 解析后的目标 URL（Host + Scheme）
+	Proxy         *httputil.ReverseProxy
+	Regex         bool           // 是否使用正则匹配
+	Generic       bool           // generic 标志（保留原语义）
+	Re            *regexp.Regexp // 若 Regex == true，则保存编译后的正则
+	TargetPathT   string         // 目标路径模板（允许包含 $1/$2 替换）
+	reSubexpCount int            // 正则捕获组数量（用于保护性校验）
 }
 
 // ConfigRuntime 保存运行时配置
@@ -50,9 +52,12 @@ type ConfigRuntime struct {
 	Port    int
 	Routes  []*Route
 	Updated time.Time
+	Valid   bool // 新增：标记配置是否有效
 }
 
-var cfg = &ConfigRuntime{}
+var cfg = &ConfigRuntime{
+	Valid: false, // 初始状态为无效
+}
 
 // Stats 保存运行指标
 type Stats struct {
@@ -72,7 +77,7 @@ var stats = &Stats{
 	lastQPSReset:   time.Now(),
 }
 
-// reloadChan 用于通知主循环重启
+// reloadChan 用于通知主循环重启（平滑重启服务器）
 var reloadChan = make(chan struct{}, 1)
 
 // loggingResponseWriter 捕获响应状态和字节数
@@ -149,23 +154,25 @@ func loadOrCreateIni() error {
 		if err := createDefaultIni(); err != nil {
 			return fmt.Errorf("解析失败且自动重建默认配置失败: %v", err)
 		}
-		return fmt.Errorf("配置文件格式错误，已备份为 %s，请检查并重启: %v", backup, err)
+		// 重建后再次尝试解析
+		if err := parseIniAndApply(iniFile); err != nil {
+			return fmt.Errorf("重建配置后仍然解析失败: %v", err)
+		}
 	}
 	return nil
 }
 
 func createDefaultIni() error {
-	content := `# 监听端口
+	content := `# 使用文档：https://github.com/izcw/RevProxy
+
+# 服务监听端口（配置文件中首次出现的纯数字）
 4288
 
-# 路由配置：格式为
-# prefix target [type]
-# 如果 type 为 regex，则 prefix 被解释为 Go 正则表达式（支持 (?i) 等标志）
-# 当 target 的 path 部分包含 $1/$2 等时，会替换为正则捕获组
-/api       http://127.0.0.1:3000
-/MFP62     http://192.168.0.100
-^/v[0-9]/.*$ http://127.0.0.1:3001 regex
-/printer   http://192.168.0.101 generic
+# 路由规则格式：路径前缀  目标地址  [匹配类型]
+/api           127.0.0.1:3000
+/MFP62         192.168.0.100
+^/v[0-9]/.*$   127.0.0.1:3001  regex
+/printer       192.168.0.101   generic
 `
 	return os.WriteFile(iniFile, []byte(content), 0644)
 }
@@ -174,7 +181,7 @@ func createDefaultIni() error {
 func parseIniAndApply(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("无法打开配置文件: %v", err)
 	}
 	defer f.Close()
 
@@ -182,6 +189,8 @@ func parseIniAndApply(path string) error {
 	var port int
 	var parsedRoutes []*Route
 	lineNo := 0
+	hasRoutes := false
+
 	for scanner.Scan() {
 		lineNo++
 		line := strings.TrimSpace(scanner.Text())
@@ -208,7 +217,6 @@ func parseIniAndApply(path string) error {
 		targetRaw := parts[1]
 
 		// 允许 target 中包含 $1/$2（仅用于 path 部分替换），但 validateTarget 仍然需要能解析 host
-		// 为此我们先尝试解析 targetRaw（如果 path 含 $xx，这不会妨碍 url.Parse）
 		targetURL, verr := validateTarget(targetRaw)
 		if verr != nil {
 			return fmt.Errorf("第 %d 行目标地址无效: %v", lineNo, verr)
@@ -235,6 +243,7 @@ func parseIniAndApply(path string) error {
 		}
 
 		var compiled *regexp.Regexp
+		var subexpCount int
 		if isRegex {
 			// 将 prefix 当作正则表达式编译
 			re, err := regexp.Compile(prefix)
@@ -242,6 +251,12 @@ func parseIniAndApply(path string) error {
 				return fmt.Errorf("第 %d 行正则表达式编译失败: %v", lineNo, err)
 			}
 			compiled = re
+			subexpCount = re.NumSubexp()
+			// 如果模板中使用了 $n，但 n 大于 re 的子表达数量，记录警告（但不致命）
+			templateMax := maxDollarIndex(targetPathTemplate)
+			if templateMax > subexpCount {
+				log.Printf("警告: 第 %d 行目标 path 模板引用了 $%d，但正则只有 %d 个捕获组，替换可能为空", lineNo, templateMax, subexpCount)
+			}
 		} else {
 			// 对非 regex 的 prefix 做常规清理：保留原样，但统一移除尾部斜杠（除了根 /）
 			if len(prefix) > 1 {
@@ -252,8 +267,30 @@ func parseIniAndApply(path string) error {
 		// 创建 ReverseProxy 并为其设置默认 Director（后面根据 route 类型覆盖）
 		proxy := httputil.NewSingleHostReverseProxy(&targetCopy)
 
-		// 这里先设置一个默认 Director（会在下面根据 route 类型覆盖为更适合的版本）
-		proxy.Director = makeDirector(prefix, &targetCopy)
+		// 设置更健壮的 Transport（连接池、超时）
+		proxy.Transport = &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			MaxIdleConnsPerHost:   20,
+		}
+
+		// 设置 ModifyResponse 以便记录后端返回错误并进行防御性处理
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			// 若后端返回 5xx，则记录详细日志（保留 body 的前 1KB）
+			if resp.StatusCode >= 500 {
+				bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+				// 重新填充 body 以便后续读
+				resp.Body = io.NopCloser(io.MultiReader(strings.NewReader(string(bodyBytes)), resp.Body))
+				log.Printf("后端 %s 返回 %d，响应体（前1KB）：%s", targetCopy.String(), resp.StatusCode, string(bodyBytes))
+			}
+			return nil
+		}
+
 		// 错误处理
 		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("proxy error -> %s | %v", r.URL.String(), err)
@@ -267,13 +304,14 @@ func parseIniAndApply(path string) error {
 		}
 
 		route := &Route{
-			Prefix:      prefix,
-			Target:      targetURL,
-			Proxy:       proxy,
-			Regex:       isRegex,
-			Generic:     isGeneric,
-			Re:          compiled,
-			TargetPathT: targetPathTemplate,
+			Prefix:        prefix,
+			Target:        &targetCopy,
+			Proxy:         proxy,
+			Regex:         isRegex,
+			Generic:       isGeneric,
+			Re:            compiled,
+			TargetPathT:   targetPathTemplate,
+			reSubexpCount: subexpCount,
 		}
 
 		// 对 regex 路由，覆盖 Director 为基于正则替换的 Director
@@ -288,24 +326,71 @@ func parseIniAndApply(path string) error {
 		}
 
 		parsedRoutes = append(parsedRoutes, route)
+		hasRoutes = true
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("读取配置文件出错: %v", err)
 	}
 
 	if port == 0 {
 		port = 4288
 	}
 
+	// 关键修复：确保至少有一条路由
+	if !hasRoutes {
+		log.Printf("警告: 配置文件中没有定义任何路由，将使用默认路由")
+		// 创建一个默认路由避免空路由列表
+		defaultTarget, _ := validateTarget("http://127.0.0.1:8080")
+		defaultProxy := httputil.NewSingleHostReverseProxy(defaultTarget)
+		defaultRoute := &Route{
+			Prefix:  "/",
+			Target:  defaultTarget,
+			Proxy:   defaultProxy,
+			Regex:   false,
+			Generic: false,
+		}
+		defaultRoute.Proxy.Director = makeDirector("/", defaultTarget)
+		parsedRoutes = append(parsedRoutes, defaultRoute)
+	}
+
 	// 按照 Prefix 长度降序排序（以便更长的 prefix 拥有更高匹配优先级）
 	sort.Slice(parsedRoutes, func(i, j int) bool {
-		return len(parsedRoutes[i].Prefix) > len(parsedRoutes[j].Prefix)
+		// 对 regex 路由，优先级以在文件中出现的顺序为主（保持稳定），但为了兼容原有逻辑：
+		// 仍然对非 regex 前缀按长度降序排序以保证长前缀优先
+		li := parsedRoutes[i]
+		lj := parsedRoutes[j]
+		// 非 regex 比 regex 更具确定性，优先放前面（但保持长度优先）
+		if li.Regex != lj.Regex {
+			return !li.Regex && lj.Regex
+		}
+		return len(li.Prefix) > len(lj.Prefix)
 	})
 
 	cfg.Lock()
 	cfg.Port = port
 	cfg.Routes = parsedRoutes
 	cfg.Updated = time.Now()
+	cfg.Valid = true // 标记配置为有效
 	cfg.Unlock()
 
+	log.Printf("配置加载成功: 端口 %d, 路由数 %d", port, len(parsedRoutes))
 	return nil
+}
+
+// maxDollarIndex 返回模板中使用的最大 $n 索引（用于警告）
+func maxDollarIndex(t string) int {
+	re := regexp.MustCompile(`\$(\d+)`)
+	max := 0
+	matches := re.FindAllStringSubmatch(t, -1)
+	for _, m := range matches {
+		if len(m) >= 2 {
+			if idx, err := strconv.Atoi(m[1]); err == nil && idx > max {
+				max = idx
+			}
+		}
+	}
+	return max
 }
 
 // -----------------------------
@@ -329,12 +414,22 @@ func makeDirector(prefix string, target *url.URL) func(*http.Request) {
 		} else {
 			newPath = joinURLPath(target.Path, trimmed)
 		}
+
+		// 保留查询字符串
+		if req.URL.RawQuery != "" {
+			newPath = newPath + "?" + req.URL.RawQuery
+		}
+
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
-		req.URL.Path = newPath
-		req.URL.RawPath = newPath
+		// 注意：ReverseProxy 会根据 req.URL.Path/RawPath 拼请求，Query 由 RawQuery 控制
+		u, _ := url.Parse(newPath)
+		req.URL.Path = u.Path
+		req.URL.RawPath = u.RawPath
+		req.URL.RawQuery = u.RawQuery
 		req.Host = target.Host
 
+		// 设置或追加 X-Forwarded-For
 		if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
 			prior := req.Header.Get("X-Forwarded-For")
 			if prior != "" {
@@ -356,11 +451,23 @@ func makeDirectorForRegex(re *regexp.Regexp, target *url.URL, targetPathTemplate
 		origPath := req.URL.Path
 		// 尝试匹配
 		matches := re.FindStringSubmatch(origPath)
+
+		// 保护性处理：如果没有匹配到，fallback 到原始路径（避免空替换）
 		replacedPath := targetPathTemplate
 		if len(matches) > 0 {
 			// 用捕获组替换目标模板中的 $1/$2...
 			replacedPath = replaceDollarRefs(targetPathTemplate, matches)
+		} else {
+			// 如果 regex 没有匹配但模板不是简单的 "/"，尝试把原始路径的截取部分拼上（保守策略）
+			if targetPathTemplate == "/" {
+				replacedPath = origPath
+			} else {
+				// 不改变模板，保持模板（较为保守）
+				// 这一分支很少见，主要在配置不当时避免 panic
+				replacedPath = joinURLPath(target.Path, origPath)
+			}
 		}
+
 		// 如果替换后得到的路径不是以 / 开头，则我们尝试以 target.Path 为基础拼接
 		var newPath string
 		if strings.HasPrefix(replacedPath, "/") {
@@ -371,11 +478,18 @@ func makeDirectorForRegex(re *regexp.Regexp, target *url.URL, targetPathTemplate
 			newPath = joinURLPath(target.Path, replacedPath)
 		}
 
+		// 保留查询字符串
+		if req.URL.RawQuery != "" {
+			newPath = newPath + "?" + req.URL.RawQuery
+		}
+
 		// 进行最终赋值
+		u, _ := url.Parse(newPath)
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
-		req.URL.Path = newPath
-		req.URL.RawPath = newPath
+		req.URL.Path = u.Path
+		req.URL.RawPath = u.RawPath
+		req.URL.RawQuery = u.RawQuery
 		req.Host = target.Host
 
 		// 保留原始客户端 IP 到 X-Forwarded-For
@@ -426,7 +540,7 @@ func joinURLPath(a, b string) string {
 }
 
 // -----------------------------
-// 热加载监控
+// 热加载监控（监控文件变化并平滑 reload）
 // -----------------------------
 func watchIniFile(path string) {
 	watcher, err := fsnotify.NewWatcher()
@@ -451,6 +565,7 @@ func watchIniFile(path string) {
 	for {
 		select {
 		case ev := <-watcher.Events:
+			// 仅对目标 path 的写入、创建、重命名等事件做处理（避免对临时文件重复触发）
 			if ev.Name == path && (ev.Op&fsnotify.Write == fsnotify.Write ||
 				ev.Op&fsnotify.Create == fsnotify.Create ||
 				ev.Op&fsnotify.Rename == fsnotify.Rename) {
@@ -463,17 +578,54 @@ func watchIniFile(path string) {
 				lastReload = time.Now()
 				reloadMu.Unlock()
 
-				log.Printf("配置文件发生更改：%s", ev.String())
-				safeRestart()
-			}
+				log.Printf("配置文件发生更改（文件系统事件）：%s", ev.String())
 
+				// 关键修复：增加延迟，等待文件写入完成
+				time.Sleep(100 * time.Millisecond)
+
+				// 尝试平滑重载配置；若解析失败，则保留现有配置并记录错误
+				if err := reloadConfig(); err != nil {
+					log.Printf("平滑重载配置失败：%v；将保持现有配置", err)
+					// 如果解析失败且问题严重，可以考虑 full restart（safeRestart），但此处保守处理
+				} else {
+					// 发送信号触发主循环重启 listener（不会完全退出进程）
+					select {
+					case reloadChan <- struct{}{}:
+						log.Printf("已发送重载信号")
+					default:
+						log.Printf("重载通道已满，跳过本次重载")
+					}
+				}
+			}
 		case err := <-watcher.Errors:
 			log.Printf("fsnotify 错误: %v", err)
 		}
 	}
 }
 
-// safeRestart 程序自重启
+// reloadConfig 解析配置并应用（用于热加载）
+func reloadConfig() error {
+	// 关键修复：先备份当前有效配置
+	cfg.RLock()
+	oldPort := cfg.Port
+	oldRoutes := cfg.Routes
+	cfg.RUnlock()
+
+	if err := parseIniAndApply(iniFile); err != nil {
+		// 如果新配置解析失败，恢复旧配置
+		cfg.Lock()
+		cfg.Port = oldPort
+		cfg.Routes = oldRoutes
+		cfg.Updated = time.Now()
+		cfg.Valid = len(oldRoutes) > 0
+		cfg.Unlock()
+		return fmt.Errorf("配置重载失败，已恢复旧配置: %v", err)
+	}
+	log.Printf("配置已重新加载并应用 (time: %s)", time.Now().Format("2006-01-02 15:04:05"))
+	return nil
+}
+
+// safeRestart 程序自重启（保留以备不可恢复情况）
 func safeRestart() {
 	execPath, err := os.Executable()
 	if err != nil {
@@ -481,7 +633,7 @@ func safeRestart() {
 		return
 	}
 
-	log.Println("检测到配置文件变更，正在重启服务...")
+	log.Println("检测到配置文件变更，正在重启服务（新进程）...")
 
 	cmd := exec.Command(execPath)
 	cmd.Stdout = os.Stdout
@@ -492,13 +644,40 @@ func safeRestart() {
 		return
 	}
 
-	log.Println("新进程已启动，退出当前进程...\n\n\n\n\n\n")
+	log.Println("新进程已启动，退出当前进程...")
 	os.Exit(0)
 }
 
 // -----------------------------
-// HTTP 处理
+// HTTP 处理（含恢复、限流、安全措施）
 // -----------------------------
+
+// safeHandler 包装 handler，捕获 panic 并记录
+func safeHandler(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 限制单次请求体大小（防止恶意大 body，限制为 10MB）
+		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+
+		defer func() {
+			if rec := recover(); rec != nil {
+				// 记录 panic 信息与堆栈（简短）
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				log.Printf("panic recovered: %v\nstack: %s", rec, string(buf[:n]))
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"status": 500,
+					"msg":    "服务器内部错误",
+				})
+			}
+		}()
+
+		h.ServeHTTP(w, r)
+	})
+}
+
+// handler 是核心路由匹配与转发逻辑
 func handler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	clientIP := r.RemoteAddr
@@ -512,35 +691,69 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	stats.Mutex.Unlock()
 
 	cfg.RLock()
-	defer cfg.RUnlock()
-	for _, route := range cfg.Routes {
+	// 关键修复：检查配置是否有效
+	if !cfg.Valid || len(cfg.Routes) == 0 {
+		cfg.RUnlock()
+		log.Printf("警告: 配置无效或路由列表为空，拒绝请求 %s %s", method, path)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": 503,
+			"msg":    "服务配置无效，请检查代理配置",
+		})
+		return
+	}
+	routes := make([]*Route, len(cfg.Routes))
+	copy(routes, cfg.Routes) // 复制一份快照供遍历，避免锁持有过久
+	cfg.RUnlock()
+
+	matched := false
+	for _, route := range routes {
+		// 先判断 regex 路由
 		if route.Regex && route.Re != nil {
-			// 使用编译后的正则进行匹配
+			// 使用编译后的正则进行匹配（MatchString 比 FindStringSubmatch 更快）
 			if route.Re.MatchString(path) {
+				matched = true
+				// 在转发前把必要的限制与超时放入上下文，防止后端挂死
+				ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+				defer cancel()
+				r2 := r.WithContext(ctx)
+
 				lw := &loggingResponseWriter{ResponseWriter: w}
-				route.Proxy.ServeHTTP(lw, r)
+				route.Proxy.ServeHTTP(lw, r2)
 				stats.Mutex.Lock()
 				stats.PerRouteCounts[route.Prefix]++
 				stats.Mutex.Unlock()
 				duration := time.Since(start)
-				log.Printf("%-4s %-5s -> %-20s | %3d | %7.2fms | %6dB | %s", method, path, route.Target.String(), lw.status, float64(duration.Microseconds())/1000.0, lw.written, clientIP)
+				log.Printf("%-4s %-5s -> %-30s | %3d | %7.2fms | %6dB | %s", method, path, route.Target.String(), lw.status, float64(duration.Microseconds())/1000.0, lw.written, clientIP)
 				return
 			}
 		} else {
 			// 非正则按前缀匹配：完全等于或以 prefix/ 开始
 			if path == route.Prefix || strings.HasPrefix(path, route.Prefix+"/") {
+				matched = true
+				ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+				defer cancel()
+				r2 := r.WithContext(ctx)
+
 				lw := &loggingResponseWriter{ResponseWriter: w}
-				route.Proxy.ServeHTTP(lw, r)
+				route.Proxy.ServeHTTP(lw, r2)
 				stats.Mutex.Lock()
 				stats.PerRouteCounts[route.Prefix]++
 				stats.Mutex.Unlock()
 				duration := time.Since(start)
-				log.Printf("%-4s %-5s -> %-20s | %3d | %7.2fms | %6dB | %s", method, path, route.Target.String(), lw.status, float64(duration.Microseconds())/1000.0, lw.written, clientIP)
+				log.Printf("%-4s %-5s -> %-30s | %3d | %7.2fms | %6dB | %s", method, path, route.Target.String(), lw.status, float64(duration.Microseconds())/1000.0, lw.written, clientIP)
 				return
 			}
 		}
 	}
+
 	// 未匹配到任何路由
+	if matched {
+		// 这个分支理论上不会到达，因为匹配成功就会return
+		log.Printf("错误: 路由匹配逻辑异常，路径 %s 应该已被处理", path)
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusNotFound)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -556,6 +769,15 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	stats.Mutex.Lock()
 	defer stats.Mutex.Unlock()
 
+	cfg.RLock()
+	configInfo := map[string]interface{}{
+		"port":        cfg.Port,
+		"routesCount": len(cfg.Routes),
+		"updated":     cfg.Updated.Format("2006-01-02 15:04:05"),
+		"valid":       cfg.Valid,
+	}
+	cfg.RUnlock()
+
 	data := map[string]interface{}{
 		"startTime":      stats.StartTime.Format("2006-01-02 15:04:05"),
 		"uptime":         int(time.Since(stats.StartTime).Seconds()),
@@ -563,6 +785,7 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		"perRouteCounts": stats.PerRouteCounts,
 		"uniqueClients":  len(stats.UniqueClients),
 		"qps":            stats.QPS,
+		"config":         configInfo,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -585,6 +808,7 @@ func printStartupBanner() {
 	port := cfg.Port
 	routes := cfg.Routes
 	updated := cfg.Updated
+	valid := cfg.Valid
 	cfg.RUnlock()
 
 	fmt.Println("════════════════════════════════════════════════════════")
@@ -592,36 +816,47 @@ func printStartupBanner() {
 	fmt.Println("────────────────────────────────────────────────────────")
 	fmt.Printf("监听端口: %d\n", port)
 	fmt.Printf("配置文件: %s (最后更新时间: %s)\n", iniFile, updated.Format("2006-01-02 15:04:05"))
+	fmt.Printf("配置状态: %v\n", valid)
 	fmt.Printf("内存占用: %d MB\n", mem.Alloc/1024/1024)
 	fmt.Printf("Go 版本: %-10s  CPU: %d 核  Goroutines: %d\n", runtime.Version(), runtime.NumCPU(), runtime.NumGoroutine())
 	fmt.Printf("启动时间: %s\n", stats.StartTime.Format("2006-01-02 15:04:05"))
 	fmt.Printf("状态监控: http://127.0.0.1:%d/status\n", port)
 	fmt.Println("────────────────────────────────────────────────────────")
-	fmt.Println("路由列表:")
-	for i := len(routes) - 1; i >= 0; i-- {
-		r := routes[i]
-		typ := "prefix"
-		if r.Regex {
-			typ = "regex"
+	if valid && len(routes) > 0 {
+		fmt.Println("路由列表:")
+		for i := len(routes) - 1; i >= 0; i-- {
+			r := routes[i]
+			typ := "prefix"
+			if r.Regex {
+				typ = "regex"
+			}
+			fmt.Printf("  %-25s -> %-30s  (%s)\n", r.Prefix, r.Target.String(), typ)
 		}
-		fmt.Printf("  %-25s -> %-30s  (%s)\n", r.Prefix, r.Target.String(), typ)
+	} else {
+		fmt.Println("警告: 当前没有有效的路由配置")
 	}
 	fmt.Println("════════════════════════════════════════════════════════")
 }
 
-// startServer 启动 http.Server
+// startServer 启动 http.Server，返回 server 对象
 func startServer() *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", statusHandler)
-	mux.HandleFunc("/", handler)
+	// 将主 handler 包装入 safeHandler（包含 panic 捕获与 body 限制）
+	mux.Handle("/", http.HandlerFunc(handler))
 
 	cfg.RLock()
 	port := cfg.Port
 	cfg.RUnlock()
 
+	// 设置更严格的服务器超时以提高稳定性
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: mux,
+		Addr:         fmt.Sprintf(":%d", port),
+		Handler:      safeHandler(mux),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+		// MaxHeaderBytes: 1 << 20,
 	}
 
 	go func() {
@@ -638,6 +873,7 @@ func startServer() *http.Server {
 // main
 // -----------------------------
 func main() {
+	// 先加载或创建配置
 	if err := loadOrCreateIni(); err != nil {
 		log.Fatalf("初始化失败: %v", err)
 	}
@@ -667,6 +903,7 @@ func main() {
 		}
 	}
 
+	// 监控配置文件变更，尝试平滑重载
 	go watchIniFile(iniFile)
 
 	printStartupBanner()
@@ -674,13 +911,33 @@ func main() {
 
 	currentServer := startServer()
 
+	// 信号处理：支持优雅关闭与 SIGHUP 平滑重载
 	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
 	for {
 		select {
-		case <-stop:
-			log.Printf("接收到退出信号，正在关闭服务器...")
+		case sig := <-stop:
+			if sig == syscall.SIGHUP {
+				// 收到 SIGHUP，尝试平滑重载配置（不退出进程）
+				log.Printf("收到 SIGHUP，尝试热加载配置...")
+				if err := reloadConfig(); err != nil {
+					log.Printf("热加载失败：%v，保留现有配置", err)
+				} else {
+					// 关闭旧 server，启动新 server（平滑切换 listener）
+					log.Printf("配置热加载成功，正在重启监听服务...")
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					if err := currentServer.Shutdown(ctx); err != nil {
+						log.Printf("关闭旧服务时出错: %v（将继续尝试启动新服务）", err)
+					}
+					cancel()
+					printStartupBanner()
+					currentServer = startServer()
+				}
+				continue
+			}
+			// 其他终止信号：优雅退出
+			log.Printf("接收到退出信号 %v，正在关闭服务器...", sig)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if err := currentServer.Shutdown(ctx); err != nil {
 				log.Fatalf("Server Shutdown Failed:%+v", err)
@@ -689,6 +946,7 @@ func main() {
 			log.Printf("服务器已关闭")
 			return
 		case <-reloadChan:
+			// 当文件监控触发平滑重载时走这里
 			log.Printf("配置变更生效：准备重启服务以应用新配置...")
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if err := currentServer.Shutdown(ctx); err != nil {
