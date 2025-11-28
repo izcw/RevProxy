@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -22,6 +23,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -29,15 +31,17 @@ import (
 const iniFile = "proxy.ini"
 
 // 全局版本
-var version = "v1.0.0"
+var version = "v1.0.4"
 
 // Route 表示一条代理规则
 type Route struct {
-	Prefix  string
-	Target  *url.URL
-	Proxy   *httputil.ReverseProxy
-	Regex   bool
-	Generic bool
+	Prefix      string   // 原始配置中的前缀（对于 regex 为正则表达式文本）
+	Target      *url.URL // 解析后的目标 URL（Host + Scheme）
+	Proxy       *httputil.ReverseProxy
+	Regex       bool           // 是否使用正则匹配
+	Generic     bool           // generic 标志（保留原语义）
+	Re          *regexp.Regexp // 若 Regex == true，则保存编译后的正则
+	TargetPathT string         // 目标路径模板（允许包含 $1/$2 替换）
 }
 
 // ConfigRuntime 保存运行时配置
@@ -97,7 +101,9 @@ func (l *loggingResponseWriter) Write(b []byte) (int, error) {
 // -----------------------------
 // URL 校验
 // -----------------------------
+// validateTarget 校验并返回解析后的 url.URL
 func validateTarget(raw string) (*url.URL, error) {
+	// 如果没有 scheme，默认 http
 	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
 		raw = "http://" + raw
 	}
@@ -115,6 +121,7 @@ func validateTarget(raw string) (*url.URL, error) {
 	if strings.Contains(hostOnly, ":") {
 		hostOnly, _, _ = net.SplitHostPort(hostOnly)
 	}
+	// 简单校验 host：localhost 或 IP 或包含点的域名
 	if hostOnly != "localhost" && net.ParseIP(hostOnly) == nil && !strings.Contains(hostOnly, ".") {
 		return nil, fmt.Errorf("目标 host 非法: %s (需为 IP 或合法域名)", hostOnly)
 	}
@@ -151,7 +158,10 @@ func createDefaultIni() error {
 	content := `# 监听端口
 4288
 
-# 路由配置
+# 路由配置：格式为
+# prefix target [type]
+# 如果 type 为 regex，则 prefix 被解释为 Go 正则表达式（支持 (?i) 等标志）
+# 当 target 的 path 部分包含 $1/$2 等时，会替换为正则捕获组
 /api       http://127.0.0.1:3000
 /MFP62     http://192.168.0.100
 ^/v[0-9]/.*$ http://127.0.0.1:3001 regex
@@ -160,6 +170,7 @@ func createDefaultIni() error {
 	return os.WriteFile(iniFile, []byte(content), 0644)
 }
 
+// parseIniAndApply 解析配置文件并应用到运行时配置
 func parseIniAndApply(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -178,6 +189,7 @@ func parseIniAndApply(path string) error {
 			continue
 		}
 
+		// 第一行（或第一处非注释非空）优先解析为端口（只有当尚未设置端口时）
 		if port == 0 {
 			if p, err := strconv.Atoi(line); err == nil {
 				if p < 1 || p > 65535 {
@@ -194,6 +206,9 @@ func parseIniAndApply(path string) error {
 		}
 		prefix := parts[0]
 		targetRaw := parts[1]
+
+		// 允许 target 中包含 $1/$2（仅用于 path 部分替换），但 validateTarget 仍然需要能解析 host
+		// 为此我们先尝试解析 targetRaw（如果 path 含 $xx，这不会妨碍 url.Parse）
 		targetURL, verr := validateTarget(targetRaw)
 		if verr != nil {
 			return fmt.Errorf("第 %d 行目标地址无效: %v", lineNo, verr)
@@ -209,36 +224,77 @@ func parseIniAndApply(path string) error {
 			}
 		}
 
+		// 复制 target，以免后续被修改
 		targetCopy := *targetURL
+
+		// 预处理：将目标 URL 的 Path 作为模板保存（可能包含 $1/$2）
+		targetPathTemplate := targetCopy.Path
+		// 如果没有显式 path，设为 "/"
+		if targetPathTemplate == "" {
+			targetPathTemplate = "/"
+		}
+
+		var compiled *regexp.Regexp
+		if isRegex {
+			// 将 prefix 当作正则表达式编译
+			re, err := regexp.Compile(prefix)
+			if err != nil {
+				return fmt.Errorf("第 %d 行正则表达式编译失败: %v", lineNo, err)
+			}
+			compiled = re
+		} else {
+			// 对非 regex 的 prefix 做常规清理：保留原样，但统一移除尾部斜杠（除了根 /）
+			if len(prefix) > 1 {
+				prefix = strings.TrimRight(prefix, "/")
+			}
+		}
+
+		// 创建 ReverseProxy 并为其设置默认 Director（后面根据 route 类型覆盖）
 		proxy := httputil.NewSingleHostReverseProxy(&targetCopy)
+
+		// 这里先设置一个默认 Director（会在下面根据 route 类型覆盖为更适合的版本）
 		proxy.Director = makeDirector(prefix, &targetCopy)
+		// 错误处理
 		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("proxy error -> %s | %v", r.URL.String(), err)
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusBadGateway)
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"status": 502,
 				"msg":    "后端服务不可用",
 				"detail": err.Error(),
 			})
 		}
 
-		if len(prefix) > 1 {
-			prefix = strings.TrimRight(prefix, "/")
+		route := &Route{
+			Prefix:      prefix,
+			Target:      targetURL,
+			Proxy:       proxy,
+			Regex:       isRegex,
+			Generic:     isGeneric,
+			Re:          compiled,
+			TargetPathT: targetPathTemplate,
 		}
-		parsedRoutes = append(parsedRoutes, &Route{
-			Prefix:  prefix,
-			Target:  targetURL,
-			Proxy:   proxy,
-			Regex:   isRegex,
-			Generic: isGeneric,
-		})
+
+		// 对 regex 路由，覆盖 Director 为基于正则替换的 Director
+		if isRegex {
+			// 用 targetCopy 的拷贝（避免引用共享）
+			targetCopy2 := targetCopy
+			route.Proxy.Director = makeDirectorForRegex(compiled, &targetCopy2, targetPathTemplate)
+		} else {
+			// 非 regex 使用先前的 Director（基于 prefix 的普通替换）
+			targetCopy2 := targetCopy
+			route.Proxy.Director = makeDirector(prefix, &targetCopy2)
+		}
+
+		parsedRoutes = append(parsedRoutes, route)
 	}
 
 	if port == 0 {
 		port = 4288
 	}
 
+	// 按照 Prefix 长度降序排序（以便更长的 prefix 拥有更高匹配优先级）
 	sort.Slice(parsedRoutes, func(i, j int) bool {
 		return len(parsedRoutes[i].Prefix) > len(parsedRoutes[j].Prefix)
 	})
@@ -252,10 +308,14 @@ func parseIniAndApply(path string) error {
 	return nil
 }
 
-// Director 函数生成
+// -----------------------------
+// Director 函数生成（非 regex 版本）
+// -----------------------------
+// makeDirector 用于常规前缀路由，基于 prefix 截断请求路径并拼接到 target.Path
 func makeDirector(prefix string, target *url.URL) func(*http.Request) {
 	return func(req *http.Request) {
 		origPath := req.URL.Path
+		// 将匹配到的 prefix 从原路径中截断
 		trimmed := strings.TrimPrefix(origPath, prefix)
 		if trimmed == "" {
 			trimmed = "/"
@@ -284,6 +344,71 @@ func makeDirector(prefix string, target *url.URL) func(*http.Request) {
 			}
 		}
 	}
+}
+
+// makeDirectorForRegex 用于正则路由：
+// - 使用 re 匹配请求路径
+// - 将 target 模板中的 $1/$2 替换为捕获组
+// - 如果目标路径模板以 / 开头则直接使用，否则以 target.Path 与替换结果做拼接（常见情况 target.Path 为 / 或 /api）
+func makeDirectorForRegex(re *regexp.Regexp, target *url.URL, targetPathTemplate string) func(*http.Request) {
+	// 返回的闭包会在请求到达时根据当前 req.URL.Path 做匹配并替换
+	return func(req *http.Request) {
+		origPath := req.URL.Path
+		// 尝试匹配
+		matches := re.FindStringSubmatch(origPath)
+		replacedPath := targetPathTemplate
+		if len(matches) > 0 {
+			// 用捕获组替换目标模板中的 $1/$2...
+			replacedPath = replaceDollarRefs(targetPathTemplate, matches)
+		}
+		// 如果替换后得到的路径不是以 / 开头，则我们尝试以 target.Path 为基础拼接
+		var newPath string
+		if strings.HasPrefix(replacedPath, "/") {
+			// 如果模板直接给出绝对路径，直接使用
+			newPath = replacedPath
+		} else {
+			// 否则以 target.Path 与 replacedPath 拼接
+			newPath = joinURLPath(target.Path, replacedPath)
+		}
+
+		// 进行最终赋值
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.URL.Path = newPath
+		req.URL.RawPath = newPath
+		req.Host = target.Host
+
+		// 保留原始客户端 IP 到 X-Forwarded-For
+		if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+			prior := req.Header.Get("X-Forwarded-For")
+			if prior != "" {
+				req.Header.Set("X-Forwarded-For", prior+", "+clientIP)
+			} else {
+				req.Header.Set("X-Forwarded-For", clientIP)
+			}
+		}
+	}
+}
+
+// replaceDollarRefs 将模板中的 $1/$2/... 替换为 matches 中对应的捕获组
+// matches[0] 是整个匹配，matches[1] 是第一个捕获组
+func replaceDollarRefs(template string, matches []string) string {
+	// 使用正则找到 $n 模式并替换
+	// 注意：$0 -> 整体匹配
+	re := regexp.MustCompile(`\$(\d+)`)
+	return re.ReplaceAllStringFunc(template, func(m string) string {
+		// 提取数字
+		sub := re.FindStringSubmatch(m)
+		if len(sub) < 2 {
+			return ""
+		}
+		idxStr := sub[1]
+		idx, err := strconv.Atoi(idxStr)
+		if err != nil || idx < 0 || idx >= len(matches) {
+			return ""
+		}
+		return matches[idx]
+	})
 }
 
 // joinURLPath
@@ -367,7 +492,7 @@ func safeRestart() {
 		return
 	}
 
-	log.Println("新进程已启动，退出当前进程...")
+	log.Println("新进程已启动，退出当前进程...\n\n\n\n\n\n")
 	os.Exit(0)
 }
 
@@ -389,10 +514,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	cfg.RLock()
 	defer cfg.RUnlock()
 	for _, route := range cfg.Routes {
-		if route.Regex {
-			// 正则匹配
-			matched := strings.HasPrefix(path, route.Prefix) // 简单版，可改为 regexp.MatchString
-			if matched {
+		if route.Regex && route.Re != nil {
+			// 使用编译后的正则进行匹配
+			if route.Re.MatchString(path) {
 				lw := &loggingResponseWriter{ResponseWriter: w}
 				route.Proxy.ServeHTTP(lw, r)
 				stats.Mutex.Lock()
@@ -403,6 +527,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
+			// 非正则按前缀匹配：完全等于或以 prefix/ 开始
 			if path == route.Prefix || strings.HasPrefix(path, route.Prefix+"/") {
 				lw := &loggingResponseWriter{ResponseWriter: w}
 				route.Proxy.ServeHTTP(lw, r)
@@ -418,7 +543,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	// 未匹配到任何路由
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusNotFound)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status": 404,
 		"msg":    "没有这个前缀的代理路由，请检查配置文件",
 	})
@@ -441,7 +566,7 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(data)
 
 	if time.Since(stats.lastQPSReset) > time.Second {
 		stats.QPS = 0
@@ -475,7 +600,11 @@ func printStartupBanner() {
 	fmt.Println("路由列表:")
 	for i := len(routes) - 1; i >= 0; i-- {
 		r := routes[i]
-		fmt.Printf("  %-15s -> %s\n", r.Prefix, r.Target.String())
+		typ := "prefix"
+		if r.Regex {
+			typ = "regex"
+		}
+		fmt.Printf("  %-25s -> %-30s  (%s)\n", r.Prefix, r.Target.String(), typ)
 	}
 	fmt.Println("════════════════════════════════════════════════════════")
 }
@@ -511,6 +640,31 @@ func startServer() *http.Server {
 func main() {
 	if err := loadOrCreateIni(); err != nil {
 		log.Fatalf("初始化失败: %v", err)
+	}
+
+	// 【新增】设置控制台窗口标题（仅Windows生效）
+	if runtime.GOOS == "windows" {
+		// 加载kernel32.dll
+		kernel32, err := syscall.LoadDLL("kernel32.dll")
+		if err != nil {
+			log.Printf("加载系统库失败: %v", err)
+		} else {
+			// 查找SetConsoleTitleW函数（宽字符版本）
+			setTitleProc, err := kernel32.FindProc("SetConsoleTitleW")
+			if err != nil {
+				log.Printf("获取系统函数失败: %v", err)
+			} else {
+				// 自定义窗口标题
+				customTitle := fmt.Sprintf("Go · MockServe %s | %d", version, cfg.Port)
+				// 调用系统函数设置标题（需要将Go字符串转为UTF-16指针）
+				_, _, err := setTitleProc.Call(
+					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(customTitle))),
+				)
+				if err != nil && err != syscall.Errno(0) {
+					log.Printf("设置窗口标题失败: %v", err)
+				}
+			}
+		}
 	}
 
 	go watchIniFile(iniFile)
