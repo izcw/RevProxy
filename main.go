@@ -32,7 +32,7 @@ import (
 const iniFile = "proxy.ini"
 
 // 全局版本
-var version = "v1.0.5" // 版本号更新
+var version = "v1.0.6" // 版本号更新
 
 // Route 表示一条代理规则
 type Route struct {
@@ -169,11 +169,9 @@ func createDefaultIni() error {
 4288
 
 # 路由规则格式：路径前缀  目标地址  [匹配类型]
-/api           127.0.0.1:3000
-/MFP62         192.168.0.100
-^/v[0-9]/.*$   127.0.0.1:3001  regex
-/printer       192.168.0.101   generic
-`
+/MFP62                        192.168.0.100
+^/DynamicPort/(\d+)/(.*)$     192.168.0.$1/$2     regex
+/printer                      192.168.0.101       generic`
 	return os.WriteFile(iniFile, []byte(content), 0644)
 }
 
@@ -445,36 +443,35 @@ func makeDirector(prefix string, target *url.URL) func(*http.Request) {
 // - 使用 re 匹配请求路径
 // - 将 target 模板中的 $1/$2 替换为捕获组
 // - 如果目标路径模板以 / 开头则直接使用，否则以 target.Path 与替换结果做拼接（常见情况 target.Path 为 / 或 /api）
+// makeDirectorForRegex 用于正则路由，支持主机名和路径的替换
 func makeDirectorForRegex(re *regexp.Regexp, target *url.URL, targetPathTemplate string) func(*http.Request) {
-	// 返回的闭包会在请求到达时根据当前 req.URL.Path 做匹配并替换
 	return func(req *http.Request) {
 		origPath := req.URL.Path
-		// 尝试匹配
 		matches := re.FindStringSubmatch(origPath)
 
-		// 保护性处理：如果没有匹配到，fallback 到原始路径（避免空替换）
+		// 替换目标主机名中的 $1/$2
+		targetHost := target.Host
+		if len(matches) > 0 {
+			targetHost = replaceDollarRefs(targetHost, matches)
+		}
+
+		// 替换目标路径模板中的 $1/$2
 		replacedPath := targetPathTemplate
 		if len(matches) > 0 {
-			// 用捕获组替换目标模板中的 $1/$2...
 			replacedPath = replaceDollarRefs(targetPathTemplate, matches)
 		} else {
-			// 如果 regex 没有匹配但模板不是简单的 "/"，尝试把原始路径的截取部分拼上（保守策略）
 			if targetPathTemplate == "/" {
 				replacedPath = origPath
 			} else {
-				// 不改变模板，保持模板（较为保守）
-				// 这一分支很少见，主要在配置不当时避免 panic
 				replacedPath = joinURLPath(target.Path, origPath)
 			}
 		}
 
-		// 如果替换后得到的路径不是以 / 开头，则我们尝试以 target.Path 为基础拼接
+		// 构建新路径
 		var newPath string
 		if strings.HasPrefix(replacedPath, "/") {
-			// 如果模板直接给出绝对路径，直接使用
 			newPath = replacedPath
 		} else {
-			// 否则以 target.Path 与 replacedPath 拼接
 			newPath = joinURLPath(target.Path, replacedPath)
 		}
 
@@ -486,11 +483,11 @@ func makeDirectorForRegex(re *regexp.Regexp, target *url.URL, targetPathTemplate
 		// 进行最终赋值
 		u, _ := url.Parse(newPath)
 		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
+		req.URL.Host = targetHost // 使用替换后的主机名
 		req.URL.Path = u.Path
 		req.URL.RawPath = u.RawPath
 		req.URL.RawQuery = u.RawQuery
-		req.Host = target.Host
+		req.Host = targetHost // 使用替换后的主机名
 
 		// 保留原始客户端 IP 到 X-Forwarded-For
 		if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
@@ -713,6 +710,22 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		if route.Regex && route.Re != nil {
 			// 使用编译后的正则进行匹配（MatchString 比 FindStringSubmatch 更快）
 			if route.Re.MatchString(path) {
+				matches := route.Re.FindStringSubmatch(path)
+
+				// 计算实际的目标地址用于日志显示
+				var actualTarget string
+				if len(matches) > 0 {
+					// 替换主机名中的 $1/$2
+					targetHost := replaceDollarRefs(route.Target.Host, matches)
+					// 替换路径模板中的 $1/$2
+					replacedPath := replaceDollarRefs(route.TargetPathT, matches)
+
+					// 构建完整的目标URL
+					actualTarget = fmt.Sprintf("%s://%s%s", route.Target.Scheme, targetHost, replacedPath)
+				} else {
+					actualTarget = route.Target.String()
+				}
+
 				matched = true
 				// 在转发前把必要的限制与超时放入上下文，防止后端挂死
 				ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
@@ -725,7 +738,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 				stats.PerRouteCounts[route.Prefix]++
 				stats.Mutex.Unlock()
 				duration := time.Since(start)
-				log.Printf("%-4s %-5s -> %-30s | %3d | %7.2fms | %6dB | %s", method, path, route.Target.String(), lw.status, float64(duration.Microseconds())/1000.0, lw.written, clientIP)
+				// 使用实际的目标地址而不是模板
+				log.Printf("%-4s %-5s -> %-30s | %3d | %7.2fms | %6dB | %s", method, path, actualTarget, lw.status, float64(duration.Microseconds())/1000.0, lw.written, clientIP)
 				return
 			}
 		} else {
