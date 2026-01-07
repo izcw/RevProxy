@@ -32,7 +32,7 @@ import (
 const iniFile = "proxy.ini"
 
 // 全局版本
-var version = "v1.0.6" // 版本号更新
+var version = "v1.0.7" // 版本号更新
 
 // Route 表示一条代理规则
 type Route struct {
@@ -85,6 +85,68 @@ type loggingResponseWriter struct {
 	http.ResponseWriter
 	status  int
 	written int64
+}
+
+// 在文件开头添加 CORS 配置
+var corsConfig = struct {
+	AllowOrigins     []string
+	AllowMethods     []string
+	AllowHeaders     []string
+	AllowCredentials bool
+	MaxAge           int
+}{
+	// 你可以根据需要修改这些配置
+	AllowOrigins:     []string{"*"}, // 生产环境建议指定具体域名，如 []string{"http://localhost:3000", "https://yourdomain.com"}
+	AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"},
+	AllowHeaders:     []string{"*"}, // 允许所有请求头，生产环境建议指定具体头
+	AllowCredentials: true,          // 如果需要携带 cookie，设为 true
+	MaxAge:           86400,         // 预检请求缓存时间（秒）
+}
+
+// corsMiddleware 处理 CORS 跨域请求
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+
+		// 设置允许的源
+		if len(corsConfig.AllowOrigins) == 1 && corsConfig.AllowOrigins[0] == "*" {
+			// 允许所有源（当 AllowCredentials 为 true 时，不能使用 *）
+			if corsConfig.AllowCredentials {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			}
+		} else {
+			// 检查是否在允许的源列表中
+			for _, allowedOrigin := range corsConfig.AllowOrigins {
+				if origin == allowedOrigin {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					break
+				}
+			}
+		}
+
+		// 设置其他 CORS 头
+		w.Header().Set("Access-Control-Allow-Methods", strings.Join(corsConfig.AllowMethods, ", "))
+		w.Header().Set("Access-Control-Allow-Headers", strings.Join(corsConfig.AllowHeaders, ", "))
+
+		if corsConfig.AllowCredentials {
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
+
+		if corsConfig.MaxAge > 0 {
+			w.Header().Set("Access-Control-Max-Age", strconv.Itoa(corsConfig.MaxAge))
+		}
+
+		// 处理预检请求（OPTIONS）
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		// 继续处理实际请求
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (l *loggingResponseWriter) WriteHeader(code int) {
@@ -866,7 +928,7 @@ func startServer() *http.Server {
 	// 设置更严格的服务器超时以提高稳定性
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
-		Handler:      safeHandler(mux),
+		Handler:      corsMiddleware(safeHandler(mux)), // 关键修改：添加
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
@@ -905,7 +967,7 @@ func main() {
 				log.Printf("获取系统函数失败: %v", err)
 			} else {
 				// 自定义窗口标题
-				customTitle := fmt.Sprintf("Go · MockServe %s | %d", version, cfg.Port)
+				customTitle := fmt.Sprintf("Go · RevProxy %s | %d", version, cfg.Port)
 				// 调用系统函数设置标题（需要将Go字符串转为UTF-16指针）
 				_, _, err := setTitleProc.Call(
 					uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(customTitle))),
